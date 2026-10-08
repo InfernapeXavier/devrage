@@ -1,17 +1,15 @@
+import { execFile } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import type { Adapter, AdapterOptions, Message, UsageRecord } from "./index";
 
 /**
- * Amp (Sourcegraph) stores threads as JSON files at:
- *   ~/.local/share/amp/threads/<thread-id>.json
- *
- * Each file is a JSON object with a `messages` array:
- *   { "messages": [{ "role": "user"|"assistant", "content": "...", ... }], "usageLedger": {...}, ... }
- *
- * Messages have `role`, `content` (string or array), and optionally a timestamp.
+ * Read legacy local threads (or manually exported JSON). When none exist, use
+ * the authenticated Amp CLI to read server-backed threads without persisting them.
  */
+const execFileAsync = promisify(execFile);
 
 function getAmpThreadsDir(): string {
   return join(process.env["XDG_DATA_HOME"] ?? join(homedir(), ".local", "share"), "amp", "threads");
@@ -21,28 +19,10 @@ export function ampAdapter(): Adapter {
   return {
     name: "amp",
     async *messages(options?: AdapterOptions): AsyncGenerator<Message> {
-      const threadsDir = getAmpThreadsDir();
       const role = options?.role ?? "user";
 
-      let files: string[];
-      try {
-        files = await readdir(threadsDir);
-      } catch {
-        return; // Amp not installed or no threads
-      }
-
-      const jsonFiles = files.filter((f) => f.endsWith(".json"));
-
-      for (const file of jsonFiles) {
-        const filePath = join(threadsDir, file);
-        const threadId = file.replace(".json", "");
-
+      for await (const { thread, threadId } of readAmpThreads(options)) {
         try {
-          const thread = await readAmpThread(filePath);
-          if (!thread) {
-            continue;
-          }
-
           if (!thread.messages || !Array.isArray(thread.messages)) {
             continue;
           }
@@ -77,26 +57,22 @@ export function ampAdapter(): Adapter {
       }
     },
     async *usage(options?: AdapterOptions): AsyncGenerator<UsageRecord> {
-      const threadsDir = getAmpThreadsDir();
-
-      let files: string[];
-      try {
-        files = await readdir(threadsDir);
-      } catch {
-        return;
-      }
-
-      for (const file of files.filter((f) => f.endsWith(".json"))) {
-        const filePath = join(threadsDir, file);
-        const threadId = file.replace(".json", "");
-
+      for await (const { thread, threadId } of readAmpThreads(options)) {
         try {
-          const thread = await readAmpThread(filePath);
-          if (!thread?.usageLedger) {
-            continue;
+          // A ledger and message usage can describe the same requests. Prefer
+          // the legacy ledger when it contains records, never count both.
+          let records = extractAmpUsageRecords(thread.usageLedger, threadId);
+          if (records.length === 0 && Array.isArray(thread.messages)) {
+            records = thread.messages.flatMap((msg) =>
+              msg?.role === "assistant" && msg.usage
+                ? extractAmpUsageRecords(msg.usage, threadId, {
+                    timestamp: msg.timestamp ?? msg.createdAt,
+                  })
+                : [],
+            );
           }
 
-          for (const record of extractAmpUsageRecords(thread.usageLedger, threadId)) {
+          for (const record of records) {
             if (options?.since && record.timestamp) {
               const ts = new Date(record.timestamp);
               if (ts < options.since) {
@@ -114,10 +90,98 @@ export function ampAdapter(): Adapter {
   };
 }
 
-async function readAmpThread(filePath: string): Promise<AmpThread | null> {
-  const raw = await readFile(filePath, "utf-8");
-  const parsed = JSON.parse(raw) as unknown;
-  return asRecord(parsed) ? (parsed as AmpThread) : null;
+async function* readAmpThreads(
+  options?: AdapterOptions,
+): AsyncGenerator<{ thread: AmpThread; threadId: string }> {
+  const threadsDir = getAmpThreadsDir();
+  let files: string[] = [];
+  try {
+    files = (await readdir(threadsDir)).filter((file) => file.endsWith(".json"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error("devrage: cannot read local Amp threads; skipping Amp.");
+      return;
+    }
+  }
+
+  if (files.length > 0) {
+    for (const file of files) {
+      try {
+        const thread = JSON.parse(await readFile(join(threadsDir, file), "utf-8"));
+        if (asRecord(thread)) {
+          yield { thread, threadId: file.slice(0, -5) };
+        }
+      } catch {
+        console.error(`devrage: skipping unreadable Amp thread ${file}.`);
+      }
+    }
+    return;
+  }
+
+  const seen = new Set<string>();
+  const pageSize = 100;
+  for (let offset = 0; ; offset += pageSize) {
+    let page: unknown;
+    try {
+      page = await ampJson([
+        "threads",
+        "list",
+        "--json",
+        "--include-archived",
+        "--limit",
+        String(pageSize),
+        "--offset",
+        String(offset),
+      ]);
+      if (!Array.isArray(page)) {
+        throw new Error("Unexpected Amp thread list format");
+      }
+    } catch (error) {
+      // Amp is optional when scanning all installed agents.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(
+          "devrage: cannot list Amp threads; check `amp threads list --json` and authentication. Results may be incomplete.",
+        );
+      }
+      return;
+    }
+
+    let newThreads = 0;
+    for (const value of page) {
+      const entry = asRecord(value);
+      const id = entry?.["id"];
+      if (typeof id !== "string" || !/^T-[0-9a-f-]+$/i.test(id) || seen.has(id)) {
+        continue;
+      }
+      seen.add(id);
+      newThreads++;
+      const updated = entry?.["updated"];
+      if (options?.since && typeof updated === "string" && new Date(updated) < options.since) {
+        continue;
+      }
+      try {
+        const thread = await ampJson(["threads", "export", id]);
+        if (!asRecord(thread)) {
+          throw new Error("Unexpected Amp thread format");
+        }
+        yield { thread: thread as AmpThread, threadId: id };
+      } catch {
+        console.error(`devrage: could not export Amp thread ${id}; results may be incomplete.`);
+      }
+    }
+    if (page.length < pageSize || newThreads === 0) {
+      return;
+    }
+  }
+}
+
+async function ampJson(args: string[]): Promise<unknown> {
+  const { stdout } = await execFileAsync("amp", args, {
+    encoding: "utf-8",
+    timeout: 60_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return JSON.parse(stdout);
 }
 
 function extractText(content: unknown): string | null {
@@ -141,6 +205,7 @@ interface AmpMessage {
   content?: unknown;
   timestamp?: string;
   createdAt?: string;
+  usage?: unknown;
 }
 
 interface AmpThread {
@@ -154,9 +219,13 @@ interface AmpUsageContext {
   timestamp?: string;
 }
 
-function extractAmpUsageRecords(usageLedger: unknown, threadId: string): UsageRecord[] {
+function extractAmpUsageRecords(
+  usageLedger: unknown,
+  threadId: string,
+  context: AmpUsageContext = {},
+): UsageRecord[] {
   const records: UsageRecord[] = [];
-  collectAmpUsage(usageLedger, threadId, records, {});
+  collectAmpUsage(usageLedger, threadId, records, context);
   return records;
 }
 
